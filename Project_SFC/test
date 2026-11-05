@@ -1,0 +1,401 @@
+=====================================================================
+ Procedura di verifica passo per passo
+=====================================================================
+
+Ogni SF (router.p4) decrementa di 1 il TTL IPv4. Classifier, SFF e
+nodi di transito NON lo toccano, perche' lavorano su MPLS e NSH.
+Gli unici router IPv4 lungo l'andata sono swa e le SF. Quindi il
+TTL letto su un link dice quante SF il pacchetto ha gia'
+attraversato:
+
+  h1 invia con TTL 64 -> swa 63 -> SF1 62 -> SF3 61 -> SF2 60 -> h3
+  h2 invia con TTL 64 -> swa 63 -> SF3 62 -> h4
+
+=====================================================================
+ PASSO 0 - PREPARAZIONE
+=====================================================================
+
+0.1 Controlla che le regole siano caricate.
+
+    # Leggiamo il contenuto delle tabelle P4 di ogni
+    # nodo che ha un ruolo nell'overlay (classifier, SFF, transit).
+
+    [swb]  echo "table_dump MyIngress.classify" | simple_switch_CLI
+           -> 2 entry encap_sfc (label 101 e 201)
+    [swb]  echo "table_dump MyIngress.ipv4_lpm" | simple_switch_CLI
+           -> l'entry 10.0.4.0/24 deve puntare a 00:00:00:00:0f:00
+              porta 4 (verso swf). Se punta a 0c:01 porta 2 (swc) hai
+              la versione vecchia di swb/commands.txt: il traffico
+              non SFC verso h4 farebbe un hop in piu' (TTL 59 nel
+              test C.2).
+
+    [swd]  echo "table_dump MyIngress.mpls_tbl" | simple_switch_CLI
+           -> 2 entry mpls_terminate (101, 103)
+    [swd]  echo "table_dump MyIngress.sff_exact" | simple_switch_CLI
+           -> 2 entry sff_proxy_decap (260, 258)
+
+    [swe]  echo "table_dump MyIngress.mpls_tbl" | simple_switch_CLI
+           -> 2 entry mpls_terminate (102, 201)
+
+    [swf]  echo "table_dump MyIngress.mpls_tbl" | simple_switch_CLI
+           -> 3 entry mpls_forward (102, 103, 104)
+
+    [swg]  echo "table_dump MyIngress.mpls_tbl" | simple_switch_CLI
+           -> 3 entry mpls_forward (102, 103, 202)
+
+    Se una tabella e' vuota, quel nodo non ha caricato le regole:
+    fermati e controlla l'output dello startup del nodo.
+
+0.2 Avvia i server iperf3 in background.
+
+    # avviamo il server iperf3 sugli host di
+    # destinazione delle due catene.
+
+    [h3]   iperf3 -s -D
+    [h4]   iperf3 -s -D
+
+
+=====================================================================
+ TEST A - CATENA 1: h1 -> h3 deve attraversare SF1, SF3, SF2
+=====================================================================
+
+A.1 Pulisci e avvia le catture. Lancia TUTTI i comandi di questo
+    passo prima di A.2.
+
+    # COSA FACCIAMO: mettiamo tcpdump in ascolto, in background, su
+    # tutti i link che ci servono come prova:
+    #   - swd eth2 e eth3: link verso SF1 e SF2;
+    #   - swe eth2: link verso SF3;
+    #   - swd e swe su tutte le interfacce (-i any): pacchetti di
+    #     ritorno da h3, che NON devono esserci;
+    #   - swb eth2: link overlay B -> D, per il formato MPLS/NSH;
+    #   - swf eth0: link F -> B, dove deve passare il ritorno;
+    #   - h3 eth0: TTL con cui i pacchetti arrivano a destinazione.
+
+    [swd]
+    pkill tcpdump; rm -f /tmp/*.txt
+    tcpdump -i eth2 -n -e -v -l 'tcp and host 10.0.3.1' > /tmp/sf1.txt 2>/dev/null &
+    tcpdump -i eth3 -n -e -v -l 'tcp and host 10.0.3.1' > /tmp/sf2.txt 2>/dev/null &
+    tcpdump -i any -n -l 'src host 10.0.3.1' > /tmp/ritorno.txt 2>/dev/null &
+
+    [swe]
+    pkill tcpdump; rm -f /tmp/*.txt
+    tcpdump -i eth2 -n -e -v -l 'tcp and host 10.0.3.1' > /tmp/sf3.txt 2>/dev/null &
+    tcpdump -i any -n -l 'src host 10.0.3.1' > /tmp/ritorno.txt 2>/dev/null &
+
+    [swb]  (link overlay B -> D)
+    pkill tcpdump; rm -f /tmp/*.txt
+    tcpdump -i eth2 -n -e -c 1 -xx mpls > /tmp/overlay.txt 2>/dev/null &
+
+    [swf]  (link F -> B, su cui passano gli ACK di ritorno)
+    pkill tcpdump; rm -f /tmp/*.txt
+    tcpdump -i eth0 -n -e -c 5 'src host 10.0.3.1' > /tmp/ritorno_fb.txt 2>/dev/null &
+
+    [h3]
+    pkill tcpdump; rm -f /tmp/*.txt
+    tcpdump -i eth0 -n -e -v -l 'tcp and src host 10.0.1.1' > /tmp/h3.txt 2>/dev/null &
+
+
+A.2 Lancia il test.
+
+    #generiamo traffico TCP da h1 a h3 sulla porta
+    # 5201, cioe' il flusso che il classifier deve mettere nella
+    # catena 1 (SPI 1).
+
+    [h1]   iperf3 -c 10.0.3.1 -M 1434 -t 10
+
+A.3 Ferma le catture.
+
+    [swd] [swe] [swb] [swf] [h3]   pkill tcpdump
+
+A.4 Verifica dell'ordine (conteggio dei TTL).
+
+    # per ogni link verso una SF contiamo quanti
+    # pacchetti sono passati con ciascun valore di TTL.
+    #solo le SF decrementano il TTL. Il valore in entrata
+    # a una SF dice quante SF il pacchetto ha gia' attraversato,
+    # quindi la sua posizione nella catena: 63 = prima, 62 = seconda,
+    # 61 = terza. Lo stesso numero di pacchetti in entrata e in uscita
+    # dimostra che TUTTO il flusso, non solo il primo pacchetto, passa
+    # dalla SF e ne esce.
+
+    [swd]  grep -o "ttl [0-9]*" /tmp/sf1.txt | sort | uniq -c
+    [swe]  grep -o "ttl [0-9]*" /tmp/sf3.txt | sort | uniq -c
+    [swd]  grep -o "ttl [0-9]*" /tmp/sf2.txt | sort | uniq -c
+    [h3]   grep -o "ttl [0-9]*" /tmp/h3.txt  | sort | uniq -c
+
+    ATTESO (N = stesso numero nelle due righe di un link):
+      sf1.txt   N ttl 62  e  N ttl 63   -> SF1 e' la 1a funzione
+      sf3.txt   N ttl 61  e  N ttl 62   -> SF3 e' la 2a funzione
+      sf2.txt   N ttl 60  e  N ttl 61   -> SF2 e' la 3a funzione
+      h3.txt    N ttl 60                -> arrivato dopo 3 SF
+
+A.5 Verifica di ordine temporale, formato e MAC (SYN).
+
+    # seguiamo lo stesso pacchetto (il SYN, che ha lo
+    # stesso "id" IP su tutti i link) e confrontiamo orari, MAC e
+    # ethertype sui tre link delle SF.
+    # gli orari danno una seconda prova dell'ordine,
+    # indipendente dal TTL. L'ethertype IPv4 (e non MPLS) dimostra
+    # che la SFF, facendo da proxy, ha tolto MPLS e NSH prima di
+    # consegnare il pacchetto: la consegna richiede che le SF
+    # ricevano solo Eth/IPv4/TCP. I MAC confermano che il pacchetto
+    # va dalla SFF alla SF e torna indietro sullo stesso link.
+
+    [swd]  grep -B1 "Flags \[S\]" /tmp/sf1.txt
+    [swe]  grep -B1 "Flags \[S\]" /tmp/sf3.txt
+    [swd]  grep -B1 "Flags \[S\]" /tmp/sf2.txt
+
+
+    Valori attesi nella riga di intestazione:
+      sf1:  0d:02 > f1:00  ttl 63    poi   f1:00 > 0d:02  ttl 62
+      sf3:  0e:02 > f3:00  ttl 62    poi   f3:00 > 0e:02  ttl 61
+      sf2:  0d:03 > f2:00  ttl 61    poi   f2:00 > 0d:03  ttl 60
+
+    Cosa controllare:
+    - A parita' di porta client (es. 47756), l'orario cresce
+      nell'ordine sf1 < sf3 < sf2. I container condividono
+      l'orologio dell'host, quindi gli orari sono confrontabili.
+    - mss: 1460 sulla connessione di controllo (iperf3 applica -M solo
+      ai dati) e 1434 sulla connessione dati.
+
+    Per il formato su un link delle SF:
+    [swd]  head -1 /tmp/sf1.txt
+    ATTESO: "ethertype IPv4 (0x0800)". Quindi la SF
+    riceve solo Eth/IPv4/TCP.
+
+A.6 Verifica del formato overlay (Eth/MPLS/NSH/Eth/IPv4/TCP).
+
+    # leggiamo byte per byte il primo pacchetto
+    # incapsulato uscito dal classifier verso D.
+    # tcpdump riconosce MPLS ma non NSH, quindi l'unico modo
+    # per vedere l'NSH e il frame interno e' il dump esadecimale
+    # (-xx). Qui verifichiamo il formato richiesto dalla consegna sul
+    # tratto classifier -> SFF e controlliamo che il classifier abbia
+    # messo i valori giusti: label 101 (tunnel B -> D), SPI 1, SI 4.
+
+    [swb]  cat /tmp/overlay.txt
+
+    ATTESO: una riga con "ethertype MPLS unicast (0x8847)" e
+    "label 101", seguita da un dump esadecimale che inizia cosi':
+
+      0x0000:  0000 0000 0d00 0000 0000 0b02 8847 0006
+      0x0010:  5140 0fc2 0203 0000 0104 0000 0000 0b00
+      0x0020:  0000 0000 0a00 0800 45..
+
+A.7 Verifica che il ritorno non passi dalle catene.
+
+    # controlliamo dove passano i pacchetti che h3
+    # manda indietro a h1 (SYN-ACK e ACK della stessa connessione).
+    # il test prevede che il traffico inverso non entri
+    # nelle catene. Se nessun pacchetto da h3 passa da D o da E,
+    # nessuna SF lo vede. La cattura su F -> B mostra dove passa
+    # davvero: in IPv4 puro, sul percorso H -> F -> B -> A.
+
+    [swd]  grep -c "10.0.3.1" /tmp/ritorno.txt      ATTESO: 0
+    [swe]  grep -c "10.0.3.1" /tmp/ritorno.txt      ATTESO: 0
+    [swf]  cat /tmp/ritorno_fb.txt
+    ATTESO: righe "ethertype IPv4 (0x0800)" da 10.0.3.1 a 10.0.1.1,
+    cioe' gli ACK di h3 in IPv4 puro, senza MPLS, sul percorso
+    H -> F -> B -> A.
+
+=====================================================================
+ TEST B - CATENA 2: h2 -> h4 deve attraversare solo SF3
+=====================================================================
+
+B.1 Avvia le catture.
+
+    # Come in A.1, ma per il flusso verso h4:
+    #   - swe eth2: link verso SF3, l'unica SF della catena 2;
+    #   - swd su tutte le interfacce: D non deve vedere NULLA di h4;
+    #   - swb eth1: link overlay B -> C (label 201);
+    #   - swg eth0: link G -> C, dove deve passare il ritorno da h4;
+    #   - swe su tutte le interfacce: il ritorno NON deve passare da E;
+    #   - h4 eth0: TTL di arrivo.
+    # per la catena 2 dobbiamo dimostrare sia che il
+    # traffico passa da SF3, sia che NON passa da SF1 e SF2. La
+    # cattura su swd e' la prova di questa seconda parte.
+
+    [swe]
+    pkill tcpdump; rm -f /tmp/*.txt
+    tcpdump -i eth2 -n -e -v -l 'tcp and host 10.0.4.1' > /tmp/sf3.txt 2>/dev/null &
+    tcpdump -i any -n -l 'src host 10.0.4.1' > /tmp/ritorno.txt 2>/dev/null &
+
+    [swd]  (SF1 e SF2 NON devono vedere questo traffico)
+    pkill tcpdump; rm -f /tmp/*.txt
+    tcpdump -i any -n -l 'host 10.0.4.1' > /tmp/nonvisto.txt 2>/dev/null &
+
+    [swb]  (link overlay B -> C)
+    pkill tcpdump; rm -f /tmp/*.txt
+    tcpdump -i eth1 -n -e -c 1 -xx mpls > /tmp/overlay.txt 2>/dev/null &
+
+    [swg]  (link G -> C, su cui passano gli ACK di ritorno)
+    pkill tcpdump; rm -f /tmp/*.txt
+    tcpdump -i eth0 -n -e -c 5 'src host 10.0.4.1' > /tmp/ritorno_gc.txt 2>/dev/null &
+
+    [h4]
+    pkill tcpdump; rm -f /tmp/*.txt
+    tcpdump -i eth0 -n -e -v -l 'tcp and src host 10.0.2.1' > /tmp/h4.txt 2>/dev/null &
+
+    Aspetta 2-3 secondi.
+
+B.2 Lancia il test.
+
+    # traffico TCP da h2 a h4 sulla porta 5201, che il
+    # classifier deve mettere nella catena 2 (SPI 2).
+
+    [h2]   iperf3 -c 10.0.4.1 -M 1434 -t 10
+
+B.3 Ferma le catture.
+
+    [swe] [swd] [swb] [swg] [h4]   pkill tcpdump
+
+B.4 Verifiche.
+
+    # Controlliamo in un colpo solo TTL, MAC, assenza
+    # del flusso su D, ritorno e formato overlay della catena 2.
+    # Con una sola SF il TTL deve calare di 1 rispetto a
+    # swa (63 -> 62) e arrivare a h4 con 62. Se fosse passato anche
+    # da SF1 o SF2, arriverebbe con un valore piu' basso e su swd
+    # comparirebbero pacchetti. Il dump overlay controlla che il
+    # classifier abbia scelto il tunnel e la catena giusti (label
+    # 201, SPI 2, SI 2).
+
+    [swe]  grep -o "ttl [0-9]*" /tmp/sf3.txt | sort | uniq -c
+           ATTESO: N ttl 62  e  N ttl 63
+    [h4]   grep -o "ttl [0-9]*" /tmp/h4.txt | sort | uniq -c
+           ATTESO: N ttl 62   (una sola SF attraversata)
+    [swe]  grep -B1 "Flags \[S\]" /tmp/sf3.txt
+           ATTESO: 0e:02 > f3:00 ttl 63, poi f3:00 > 0e:02 ttl 62
+    [swd]  grep -c "10.0.4.1" /tmp/nonvisto.txt
+           ATTESO: 0   (D, e quindi SF1 e SF2, non vedono il flusso)
+    [swe]  grep -c "10.0.4.1" /tmp/ritorno.txt
+           ATTESO: 0   (gli ACK di h4 non passano da E)
+    [swg]  cat /tmp/ritorno_gc.txt
+           ATTESO: ACK 10.0.4.1 -> 10.0.2.1 in IPv4 puro
+                   (percorso H -> G -> C -> A)
+    [swb]  cat /tmp/overlay.txt
+           ATTESO: "label 201" e dump che inizia con
+             0x0000:  0000 0000 0c01 0000 0000 0b01 8847 000c
+             0x0010:  9140 0fc2 0203 0000 0202 ...
+           (MPLS label 201, NSH SPI 2, SI 2)
+
+ESITO TEST B: superato se tutte le righe di B.4 corrispondono.
+
+=====================================================================
+ TEST C - OVERLAY TRA DUE SFF (link G <-> E, catena 1)
+=====================================================================
+
+C.1 Avvia le catture sul link swg - swe.
+
+    # Catturiamo un pacchetto per ciascuno dei due
+    # tunnel che attraversano il link tra G ed E durante la catena 1:
+    #   - label 102: tunnel D -> E (pacchetto uscito da SF1, diretto
+    #     a SF3);
+    #   - label 103: tunnel E -> D (pacchetto uscito da SF3, diretto
+    #     a SF2).
+    # Il filtro 'mpls 102' cattura solo i pacchetti con quella label.
+    # il tratto SFF -> SFF, e qui si vede anche che dopo ogni SF il proxy rimette l'NSH
+    # con l'SI decrementato (4 -> 3 -> 2).
+
+    [swg]
+    pkill tcpdump; rm -f /tmp/*.txt
+    tcpdump -i eth1 -n -e -c 1 -xx 'mpls 102' > /tmp/ov102.txt 2>/dev/null &
+    tcpdump -i eth1 -n -e -c 1 -xx 'mpls 103' > /tmp/ov103.txt 2>/dev/null &
+
+    Aspetta 2-3 secondi.
+
+C.2 Genera traffico sulla catena 1.
+
+    [h1]   iperf3 -c 10.0.3.1 -M 1434 -t 5
+
+C.3 Leggi le catture.
+
+    # decodifichiamo i due dump esadecimali come in A.6.
+    # Controlliamo label, MAC, TTL MPLS e coppia SPI/SI di
+    # ciascun tunnel.
+
+    [swg]  cat /tmp/ov102.txt
+    ATTESO (da G verso E, label 102, SPI 1, SI 3):
+      ... 00:00:00:00:07:01 > 00:00:00:00:0e:01, ethertype MPLS unicast (0x8847) ... MPLS (label 102, ... ttl 62)
+      0x0000:  0000 0000 0e01 0000 0000 0701 8847 0006
+      0x0010:  613e 0fc2 0203 0000 0103 ...
+    TTL MPLS 62: D lo imposta a 64 e lo decrementano F e poi G.
+
+    [swg]  cat /tmp/ov103.txt
+    ATTESO (da E verso G, label 103, SPI 1, SI 2):
+      ... 00:00:00:00:0e:01 > 00:00:00:00:07:01, ethertype MPLS unicast (0x8847) ... MPLS (label 103, ... ttl 64)
+      0x0000:  0000 0000 0701 0000 0000 0e01 8847 0006
+      0x0010:  7140 0fc2 0203 0000 0102 ...
+    TTL MPLS 64: E lo ha appena impostato, G non l'ha ancora
+    elaborato.
+
+=====================================================================
+ TEST E - TRAFFICO INVERSO CON IPERF3
+=====================================================================
+
+E.1 Avvia i server sugli host di origine delle catene.
+
+    # Questa volta i server sono h1 e h2 e i client
+    # h3 e h4, cosi' il flusso principale va nella direzione inversa.
+    # Testare con iperf3 anche il
+    # traffico inverso. Il classifier confronta l'IP sorgente: un
+    # flusso che parte da h3 o da h4 non corrisponde a nessuna policy,
+    # quindi deve viaggiare tutto in IPv4.
+
+    [h1]   iperf3 -s -D
+    [h2]   iperf3 -s -D
+
+E.2 Avvia le catture.
+
+    #   - su swd e swe catturiamo tutto il traffico di h1 e h2, piu'
+    #     qualsiasi pacchetto MPLS;
+    #   - su h1 e h2 catturiamo i pacchetti in arrivo, per leggerne il
+    #     TTL.
+    # Durante questo test nessuna catena e' attiva, quindi
+    # su D ed E non deve passare niente, ne' IPv4 ne' MPLS. Il TTL
+    # di arrivo dice quanti router ha attraversato il traffico
+    # inverso, cioe' se il percorso e' minimo.
+
+    [swd]
+    pkill tcpdump; rm -f /tmp/*.txt
+    tcpdump -i any -n -l 'host 10.0.1.1 or host 10.0.2.1 or mpls' > /tmp/inv.txt 2>/dev/null &
+
+    [swe]
+    pkill tcpdump; rm -f /tmp/*.txt
+    tcpdump -i any -n -l 'host 10.0.1.1 or host 10.0.2.1 or mpls' > /tmp/inv.txt 2>/dev/null &
+
+    [h1]
+    pkill tcpdump; rm -f /tmp/*.txt
+    tcpdump -i eth0 -n -v -l 'tcp and src host 10.0.3.1' > /tmp/inv.txt 2>/dev/null &
+
+    [h2]
+    pkill tcpdump; rm -f /tmp/*.txt
+    tcpdump -i eth0 -n -v -l 'tcp and src host 10.0.4.1' > /tmp/inv.txt 2>/dev/null &
+
+    Aspetta 2-3 secondi.
+
+E.3 Lancia i due test, uno dopo l'altro.
+
+    [h3]   iperf3 -c 10.0.1.1 -M 1434 -t 10
+    [h4]   iperf3 -c 10.0.2.1 -M 1434 -t 10
+
+E.4 Ferma le catture.
+
+    [swd] [swe] [h1] [h2]   pkill tcpdump
+
+E.5 Verifiche.
+
+    # Contiamo i pacchetti su D ed E e leggiamo i TTL
+    # di arrivo su h1 e h2.
+    #   - 0 pacchetti su D ed E dimostra che il traffico inverso non
+    #     entra nelle catene;
+    #   - TTL 60 su tutti i pacchetti vuol dire 4 router attraversati:
+    #       h3 -> h1: swh, swf, swb, swa
+    #       h4 -> h2: swh, swg, swc, swa
+    #     cioe' il percorso IPv4 minimo richiesto dalla consegna.
+
+    [swd]  grep -c "IP\|MPLS" /tmp/inv.txt                       ATTESO: 0
+    [swe]  grep -c "IP\|MPLS" /tmp/inv.txt                       ATTESO: 0
+    [h1]   grep -o "ttl [0-9]*" /tmp/inv.txt | sort | uniq -c    ATTESO: solo ttl 60
+    [h2]   grep -o "ttl [0-9]*" /tmp/inv.txt | sort | uniq -c    ATTESO: solo ttl 60

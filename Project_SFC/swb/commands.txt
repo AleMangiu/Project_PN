@@ -1,7 +1,7 @@
 table_add MyIngress.ipv4_lpm ipv4_forward 10.0.1.0/24 => 00:00:00:00:0A:02 1
 table_add MyIngress.ipv4_lpm ipv4_forward 10.0.2.0/24 => 00:00:00:00:0A:02 1
 table_add MyIngress.ipv4_lpm ipv4_forward 10.0.3.0/24 => 00:00:00:00:0F:00 4
-table_add MyIngress.ipv4_lpm ipv4_forward 10.0.4.0/24 => 00:00:00:00:0C:01 2
+table_add MyIngress.ipv4_lpm ipv4_forward 10.0.4.0/24 => 00:00:00:00:0F:00 4
 
-table_add MyIngress.classify encap_sfc 10.0.1.1 10.0.3.1 6 5201 => 1 4 100 3 00:00:00:00:0D:00
-table_add MyIngress.classify encap_sfc 10.0.2.1 10.0.4.1 6 5201 => 2 2 200 2 00:00:00:00:0C:01
+table_add MyIngress.classify encap_sfc 10.0.1.1 10.0.3.1 6 5201 => 1 4 101 3 00:00:00:00:0D:00 00:00:00:00:0B:02
+table_add MyIngress.classify encap_sfc 10.0.2.1 10.0.4.1 6 5201 => 2 2 201 2 00:00:00:00:0C:01 00:00:00:00:0B:01

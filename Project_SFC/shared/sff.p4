@@ -1,12 +1,23 @@
 #include <core.p4>
 #include <v1model.p4>
 
+/*
+ * One program, three roles (selected only by the table entries in commands.txt):
+ *   - MPLS transit (SWC, SWF, SWG): forwards on the MPLS label, never looks at NSH.
+ *   - SFF + proxy   (SWD, SWE):     terminates the tunnel, decides on (SPI, SI),
+ *                                   strips/restores NSH around non-NSH-aware SFs.
+ *   - Egress        (SWH):          terminates the tunnel and, at chain end,
+ *                                   delivers the plain Eth/IPv4/TCP packet.
+ * All nodes also do plain IPv4 LPM forwarding for return / non-SFC traffic.
+ */
+
 typedef bit<9>  egressSpec_t;
 typedef bit<48> macAddr_t;
 typedef bit<32> ip4Addr_t;
 
 const bit<16> TYPE_IPV4 = 0x0800;
 const bit<16> TYPE_MPLS = 0x8847;
+const bit<8>  NSH_NEXT_ETH = 3;
 
 /* ============================ HEADERS ============================ */
 header ethernet_t {
@@ -50,6 +61,7 @@ header mpls_t {
     bit<8>  ttl;
 }
 
+// RFC 8300 base header (4 bytes) + service path header (4 bytes) = 8 bytes
 header nsh_t {
     bit<2>  ver;
     bit<1>  o;
@@ -59,7 +71,7 @@ header nsh_t {
     bit<4>  u_flags;
     bit<4>  md_type;
     bit<8>  next_proto;
-    bit<32> spi_si;
+    bit<32> spi_si;     // SPI (24 bit) << 8 | SI (8 bit)
 }
 
 struct headers {
@@ -87,8 +99,8 @@ parser MyParser(packet_in packet, out headers hdr, inout metadata meta, inout st
             default: accept;
         }
     }
-    
-    // Parse normal IPv4 traffic
+
+    // Plain IPv4 traffic (return traffic, traffic coming back from an SF)
     state parse_ipv4 {
         packet.extract(hdr.ipv4);
         transition select(hdr.ipv4.protocol) {
@@ -96,11 +108,23 @@ parser MyParser(packet_in packet, out headers hdr, inout metadata meta, inout st
             default: accept;
         }
     }
-    
-    // Parse SFC encapsulated traffic
+
+    state parse_tcp {
+        packet.extract(hdr.tcp);
+        transition accept;
+    }
+
+    // SFC overlay: Eth / MPLS / NSH / Eth / IPv4 / TCP
     state parse_mpls {
         packet.extract(hdr.mpls);
         packet.extract(hdr.nsh);
+        transition select(hdr.nsh.next_proto) {
+            NSH_NEXT_ETH: parse_inner_ethernet;
+            default: accept;
+        }
+    }
+
+    state parse_inner_ethernet {
         packet.extract(hdr.inner_ethernet);
         transition select(hdr.inner_ethernet.etherType) {
             TYPE_IPV4: parse_inner_ipv4;
@@ -115,11 +139,6 @@ parser MyParser(packet_in packet, out headers hdr, inout metadata meta, inout st
             default: accept;
         }
     }
-    
-    state parse_tcp {
-        packet.extract(hdr.tcp);
-        transition accept;
-    }
 
     state parse_inner_tcp {
         packet.extract(hdr.inner_tcp);
@@ -131,11 +150,12 @@ control MyVerifyChecksum(inout headers hdr, inout metadata meta) { apply { } }
 
 /* ============================ INGRESS ============================ */
 control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadata_t sm) {
+
     action drop() {
         mark_to_drop(sm);
     }
 
-    // 1. NORMAL IPv4 ROUTING
+    /* ---------- 1. Plain IPv4 routing (return traffic, shortest path) ---------- */
     action ipv4_forward(macAddr_t dstAddr, egressSpec_t port) {
         sm.egress_spec = port;
         hdr.ethernet.srcAddr = hdr.ethernet.dstAddr;
@@ -144,37 +164,47 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
     }
 
     table ipv4_lpm {
-        key = {
-            hdr.ipv4.dstAddr : lpm;
-        }
-        actions = {
-            ipv4_forward;
-            drop;
-        }
+        key = { hdr.ipv4.dstAddr : lpm; }
+        actions = { ipv4_forward; drop; }
         size = 1024;
         default_action = drop();
     }
 
-    // 2. SFF FORWARDING (Passes the encapsulated packet to next SFF)
-    action sff_forward(macAddr_t srcMac, macAddr_t dstMac, egressSpec_t port) {
+    /* ---------- 2. MPLS tunnel layer ---------- */
+
+    // Transit LSR: the label identifies the tunnel, the packet keeps its label
+    // (no swap needed because labels are unique per tunnel). NSH is not touched.
+    action mpls_forward(macAddr_t srcMac, macAddr_t dstMac, egressSpec_t port) {
         hdr.ethernet.srcAddr = srcMac;
         hdr.ethernet.dstAddr = dstMac;
-        hdr.nsh.ttl = hdr.nsh.ttl - 1;
+        hdr.mpls.ttl = hdr.mpls.ttl - 1;
         sm.egress_spec = port;
     }
 
-    // 3. PROXY DECAPSULATION (Strips NSH and sends to local SF)
-    action sff_proxy_decap(macAddr_t sfMac, egressSpec_t sfPort) {
-        // Promote inner headers to outer headers
+    // Tail end of the tunnel: this node is the overlay element the tunnel points to.
+    // The actual pop happens in the SFF action selected by (SPI, SI).
+    action mpls_terminate() { }
+
+    table mpls_tbl {
+        key = { hdr.mpls.label : exact; }
+        actions = { mpls_forward; mpls_terminate; drop; }
+        size = 256;
+        default_action = drop();
+    }
+
+    /* ---------- 3. SFF: decision on (SPI, SI) ---------- */
+
+    // Proxy decapsulation: pop MPLS + NSH, send plain Eth/IPv4/TCP to the local SF.
+    // Also used at the egress node (SWH) to deliver the packet at chain completion.
+    action sff_proxy_decap(macAddr_t srcMac, macAddr_t dstMac, egressSpec_t port) {
         hdr.ethernet = hdr.inner_ethernet;
-        hdr.ipv4 = hdr.inner_ipv4;
-        hdr.tcp = hdr.inner_tcp;
-        
-        // Send to SF
-        hdr.ethernet.dstAddr = sfMac;
-        sm.egress_spec = sfPort;
-        
-        // Remove encapsulation
+        hdr.ipv4     = hdr.inner_ipv4;
+        hdr.tcp      = hdr.inner_tcp;
+
+        hdr.ethernet.srcAddr = srcMac;
+        hdr.ethernet.dstAddr = dstMac;
+        sm.egress_spec = port;
+
         hdr.mpls.setInvalid();
         hdr.nsh.setInvalid();
         hdr.inner_ethernet.setInvalid();
@@ -182,35 +212,43 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
         hdr.inner_tcp.setInvalid();
     }
 
-    table sff_exact {
-        key = {
-            hdr.nsh.spi_si : exact;
-        }
-        actions = {
-            sff_forward;
-            sff_proxy_decap;
-            drop;
-        }
-        size = 1024;
-        default_action = drop();
+    // Forward to another SFF through a new MPLS tunnel (NSH kept as is).
+    // Not needed by the two chains of the assignment, kept for completeness.
+    action sff_forward_tunnel(bit<20> mpls_label, macAddr_t srcMac, macAddr_t dstMac, egressSpec_t port) {
+        hdr.mpls.label = mpls_label;
+        hdr.mpls.ttl = 64;
+        hdr.nsh.ttl = hdr.nsh.ttl - 1;
+        hdr.ethernet.srcAddr = srcMac;
+        hdr.ethernet.dstAddr = dstMac;
+        sm.egress_spec = port;
     }
 
-    // 4. PROXY RE-ENCAPSULATION (Receives from SF, puts NSH back with updated SI)
-    action sff_proxy_encap(bit<32> new_spi_si, bit<20> mpls_label, macAddr_t dstMac, egressSpec_t port) {
-        meta.is_sfc = 1;
-        
-        // Push original to inner
-        hdr.inner_ethernet = hdr.ethernet;
-        hdr.inner_ipv4 = hdr.ipv4;
-        hdr.inner_tcp = hdr.tcp;
+    table sff_exact {
+        key = { hdr.nsh.spi_si : exact; }
+        actions = { sff_proxy_decap; sff_forward_tunnel; drop; }
+        size = 1024;
+        default_action = drop();   // invalid / unsupported (SPI, SI)
+    }
 
-        // Build new outer headers
+    /* ---------- 4. SFF proxy: packet coming back from a local SF ---------- */
+
+    // Restore the NSH context (SI already decremented in the table entry)
+    // and push the MPLS label of the tunnel toward the next overlay element.
+    action sff_proxy_encap(bit<32> new_spi_si, bit<20> mpls_label,
+                           macAddr_t srcMac, macAddr_t dstMac, egressSpec_t port) {
+        meta.is_sfc = 1;
+
+        hdr.inner_ethernet = hdr.ethernet;
+        hdr.inner_ipv4     = hdr.ipv4;
+        hdr.inner_tcp      = hdr.tcp;
+
+        hdr.ethernet.srcAddr   = srcMac;
+        hdr.ethernet.dstAddr   = dstMac;
         hdr.ethernet.etherType = TYPE_MPLS;
-        hdr.ethernet.dstAddr = dstMac;
 
         hdr.mpls.setValid();
         hdr.mpls.label = mpls_label;
-        hdr.mpls.tc = 0;
+        hdr.mpls.tc  = 0;
         hdr.mpls.bos = 1;
         hdr.mpls.ttl = 64;
 
@@ -221,8 +259,8 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
         hdr.nsh.ttl = 63;
         hdr.nsh.length = 2;
         hdr.nsh.u_flags = 0;
-        hdr.nsh.md_type = 1;
-        hdr.nsh.next_proto = 3;
+        hdr.nsh.md_type = 2;
+        hdr.nsh.next_proto = NSH_NEXT_ETH;
         hdr.nsh.spi_si = new_spi_si;
 
         hdr.ipv4.setInvalid();
@@ -230,16 +268,15 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
         sm.egress_spec = port;
     }
 
+    // The SF is not NSH-aware: the context is reconstructed from
+    // (port the SF is attached to, flow addresses).
     table sf_return {
         key = {
-            sm.ingress_port: exact;
+            sm.ingress_port : exact;
             hdr.ipv4.srcAddr: exact;
             hdr.ipv4.dstAddr: exact;
         }
-        actions = {
-            sff_proxy_encap;
-            NoAction;
-        }
+        actions = { sff_proxy_encap; NoAction; }
         size = 1024;
         default_action = NoAction();
     }
@@ -247,16 +284,25 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
     apply {
         meta.is_sfc = 0;
 
-        // Condition A: Packet has NSH (Arriving from Classifier or SFF)
-        if (hdr.nsh.isValid()) {
-            sff_exact.apply();
+        if (hdr.mpls.isValid()) {
+            // Overlay packet: first the tunnel layer, then (if terminated here) the SFF layer
+            if (hdr.mpls.ttl <= 1) {
+                drop();
+            } else {
+                switch (mpls_tbl.apply().action_run) {
+                    mpls_terminate: {
+                        if (!hdr.nsh.isValid() || hdr.nsh.ttl == 0) {
+                            drop();
+                        } else {
+                            sff_exact.apply();
+                        }
+                    }
+                }
+            }
         }
-        // Condition B: Normal IPv4 packet (Could be return traffic from SF or a simple Ping)
         else if (hdr.ipv4.isValid()) {
-            // Check if it's returning from a local SF
+            // Either a packet returning from a local SF, or ordinary IPv4 traffic
             sf_return.apply();
-            
-            // If it wasn't re-encapsulated, it's normal traffic, route via LPM
             if (meta.is_sfc == 0) {
                 ipv4_lpm.apply();
             }
@@ -304,7 +350,8 @@ control MyDeparser(packet_out packet, in headers hdr) {
 V1Switch(
     MyParser(),
     MyVerifyChecksum(),
-    MyIngress(), MyEgress(),
+    MyIngress(),
+    MyEgress(),
     MyComputeChecksum(),
     MyDeparser()
 ) main;

@@ -128,7 +128,7 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
         default_action = drop();
     }
 
-    action encap_sfc(bit<24> spi, bit<8> si, bit<20> mpls_label, egressSpec_t port, macAddr_t dstMac) {
+    action encap_sfc(bit<24> spi, bit<8> si, bit<20> mpls_label, egressSpec_t port, macAddr_t dstMac, macAddr_t srcMac) {
         meta.is_sfc = 1;
         
         // 1. Preserve original packet inside inner headers
@@ -138,10 +138,10 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
 
         // 2. Build Outer Ethernet for overlay transport
         hdr.ethernet.dstAddr = dstMac;
-        hdr.ethernet.srcAddr = 0x0000000000B2; // Local switch MAC
+        hdr.ethernet.srcAddr = srcMac;   // MAC of the egress interface toward the tunnel
         hdr.ethernet.etherType = TYPE_MPLS;
 
-        // 3. Build MPLS Header
+        // 3. Push MPLS label: it identifies the tunnel classifier -> first SFF
         hdr.mpls.setValid();
         hdr.mpls.label = mpls_label;
         hdr.mpls.tc = 0;
@@ -156,7 +156,8 @@ control MyIngress(inout headers hdr, inout metadata meta, inout standard_metadat
         hdr.nsh.ttl = 63;
         hdr.nsh.length = 2;       // 8 bytes -> 2 words
         hdr.nsh.u_flags = 0;
-        hdr.nsh.md_type = 1;      // No metadata attached
+        hdr.nsh.md_type = 2;      // MD Type 2 with no context headers (RFC 8300):
+                                  // base header + service path header = 8 bytes
         hdr.nsh.next_proto = 3;   // Next is Ethernet (RFC 8300)
         hdr.nsh.spi_si = ((bit<32>)spi << 8) | (bit<32>)si;
 
